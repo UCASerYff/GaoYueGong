@@ -1,0 +1,11 @@
+{
+  "module": "Monthly",
+  "name": "搞月供",
+  "bundle_id": "com.gaoseries.GaoYueGong",
+  "executable": "GaoYueGong",
+  "scheme": "gaoyuegong",
+  "widget_folder": "Widgets",
+  "widget": "GaoYueGongWidgets",
+  "group": "5G96498KGJ.com.gaoseries.GaoYueGong",
+  "preferences": "com.gaoseries.GaoYueGong.Monthly"
+}
