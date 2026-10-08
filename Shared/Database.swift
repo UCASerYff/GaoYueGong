@@ -21,15 +21,23 @@ final class Database {
     else { throw AppError("共享容器不可用，请重新安装签名版本 / Shared container unavailable") }
     return url.appendingPathComponent("Monthly", isDirectory: true)
   }
-  init(directory: URL? = nil) throws {
+  init(directory: URL? = nil, createIfMissing: Bool = true) throws {
     self.directory = try directory ?? Self.location()
-    try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+    if createIfMissing {
+      try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+    }
     guard
       sqlite3_open_v2(
         self.directory.appendingPathComponent("monthly.sqlite").path, &db,
-        SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK
+        (createIfMissing ? SQLITE_OPEN_CREATE : 0) | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK
     else { throw AppError("数据库无法打开 / Cannot open database") }
     sqlite3_busy_timeout(db, 15_000)
+    // Extensions must never seed a missing table/row or replace an unreadable save.
+    // Opening without SQLITE_OPEN_CREATE also closes the preflight file-existence race.
+    if !createIfMissing {
+      _ = try read()
+      return
+    }
     try withBusyRetry {
       // journal_mode=WAL 是启动期重入点：已是 WAL 时保持原样（只读查询），避免并发启动时争抢写锁。
       if try journalMode() != "wal" { try exec("PRAGMA journal_mode=WAL") }

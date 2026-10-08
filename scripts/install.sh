@@ -25,6 +25,5 @@ if ! ditto "$SOURCE" "$TARGET" || ! codesign --verify --deep --strict "$TARGET" 
 fi
 pluginkit -a "$TARGET/Contents/PlugIns/GaoYueGongWidgets.appex"
 killall -TERM GaoYueGongWidgets 2>/dev/null || true
-killall -TERM chronod 2>/dev/null || true
 rm -rf "$ROOT/.install.noindex"
 echo "Installed $TARGET"

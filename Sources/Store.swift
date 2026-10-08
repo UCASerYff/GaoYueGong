@@ -16,16 +16,28 @@ import WidgetKit
   @Published var coverage = ""
   private var db: Database?
   private var scheduleTask: Task<Void, Never>?
+  private var widgetChangeObserver: NSObjectProtocol?
   /// app 级语言（gqns.language）变化时推动界面重渲染；en 直读解析器，不依赖本字段取值。
   @Published private var languageRevision = 0
   /// 语言统一读 app 级设置中心的 gqns.language；存档里的 preferences.language 保留为旧数据字段，不再驱动界面。
   var en: Bool { GQNSLanguage.isEnglish }
   func t(_ zh: String, _ en: String) -> String { self.en ? en : zh }
   init() {
+    // Only the widget's marker is observed: our own update notifications must not reload recursively.
+    widgetChangeObserver = DistributedNotificationCenter.default().addObserver(
+      forName: Notification.Name("GaoSeries.monthly.changed"), object: "GaoYueGongWidgets", queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor in self?.reload() }
+    }
     NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
       Task { @MainActor in self?.languageRevision += 1 }
     }
     reload()
+  }
+  deinit {
+    if let widgetChangeObserver {
+      DistributedNotificationCenter.default().removeObserver(widgetChangeObserver)
+    }
   }
   func reload() {
     do {

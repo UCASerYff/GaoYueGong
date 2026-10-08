@@ -35,7 +35,8 @@ public struct MonthlyModuleView: View {
     private func handleRoute() {
         guard routeRevision > handledRevision, route?.scheme == "gaoyuegong" else { return }
         handledRevision = routeRevision
-        store.tab = 0
+        store.reload()
+        store.tab = route?.host == "benefits" ? 1 : 0
     }
 }
 
@@ -50,4 +51,3 @@ public struct MonthlySettingsView: View {
             .environment(\.locale, Locale(identifier: store.en ? "en_US" : "zh_CN"))
     }
 }
-
