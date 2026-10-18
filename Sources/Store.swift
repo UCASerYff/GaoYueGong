@@ -17,6 +17,11 @@ import WidgetKit
   private var db: Database?
   private var scheduleTask: Task<Void, Never>?
   private var widgetChangeObserver: NSObjectProtocol?
+  private var clockObservers: [NSObjectProtocol] = []
+  private var wakeObserver: NSObjectProtocol?
+  private var midnightTimer: Timer?
+  private var lastWidgetRequest: Date?
+  private var lastWidgetRevision: String?
   /// app 级语言（gqns.language）变化时推动界面重渲染；en 直读解析器，不依赖本字段取值。
   @Published private var languageRevision = 0
   /// 语言统一读 app 级设置中心的 gqns.language；存档里的 preferences.language 保留为旧数据字段，不再驱动界面。
@@ -27,10 +32,21 @@ import WidgetKit
     widgetChangeObserver = DistributedNotificationCenter.default().addObserver(
       forName: Notification.Name("GaoSeries.monthly.changed"), object: "GaoYueGongWidgets", queue: .main
     ) { [weak self] _ in
-      Task { @MainActor in self?.reload() }
+      Task { @MainActor in self?.reload(reason: "widget-change", requestWidgets: false) }
     }
     NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
       Task { @MainActor in self?.languageRevision += 1 }
+    }
+    for name in [Notification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange,
+                 Notification.Name("NSSystemClockDidChangeNotification")] {
+      clockObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+        Task { @MainActor in self?.reload(reason: "clock-change") }
+      })
+    }
+    wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor in self?.reload(reason: "wake") }
     }
     reload()
   }
@@ -38,11 +54,18 @@ import WidgetKit
     if let widgetChangeObserver {
       DistributedNotificationCenter.default().removeObserver(widgetChangeObserver)
     }
+    for observer in clockObservers { NotificationCenter.default.removeObserver(observer) }
+    if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+    midnightTimer?.invalidate()
   }
-  func reload() {
+  func reload() { reload(reason: "app-active") }
+  private func reload(reason: String, requestWidgets: Bool = true) {
     do {
-      if db == nil { db = try Database() }
+      // Reopen the current path, rather than retaining a connection to a restored/replaced file.
+      let hasSettings = !(UserDefaults.standard.persistentDomain(forName: "com.gaoseries.GaoYueGong.Monthly") ?? [:]).isEmpty
+      db = try Database.openForApplication(hasExistingUserSettings: hasSettings)
       state = try db!.read()
+      MonthlyBundle.defaults.set(true, forKey: "database.initialized")
       fatal = nil
       // V0.4 一次性经济补发：旧规则下该得而未得的小鱼干。
       if !state.tombstones.contains("migration|fish-backfill-v1") {
@@ -61,21 +84,52 @@ import WidgetKit
       if (state.preferences.language == "en") != GQNSLanguage.isEnglish {
         update { $0.preferences.language = GQNSLanguage.isEnglish ? "en" : "zh" }
       }
-    } catch { fatal = error.localizedDescription }
+      scheduleMidnightRefresh()
+      if requestWidgets { refreshWidgets(reason: reason) }
+    } catch {
+      db = nil
+      fatal = error.localizedDescription
+      if requestWidgets { refreshWidgets(reason: "read-failed") }
+    }
+  }
+  private func scheduleMidnightRefresh() {
+    midnightTimer?.invalidate()
+    let now = Date(), calendar = Engine.calendar(state)
+    guard let next = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) else { return }
+    midnightTimer = Timer.scheduledTimer(withTimeInterval: max(1, next.timeIntervalSince(now) + 1), repeats: false) { [weak self] _ in
+      Task { @MainActor in self?.reload(reason: "day-boundary") }
+    }
+  }
+  private func refreshWidgets(reason: String) {
+    let loaded = MonthlyWidgetData.load(consumer: "app/" + reason)
+    // Coalesce only immediate duplicate lifecycle notifications; no polling reload loop.
+    if let lastWidgetRequest, Date().timeIntervalSince(lastWidgetRequest) < 3,
+       lastWidgetRevision == loaded.sourceRevision { return }
+    do { try MonthlyWidgetData.recordReloadRequest(reason: reason) }
+    catch { notice = t("资料保留，小组件刷新登记失败，稍后重试。", "Data preserved. Widget refresh registration failed; retry later.") }
+    for kind in MonthlyWidgetData.kinds { WidgetCenter.shared.reloadTimelines(ofKind: kind) }
+    lastWidgetRequest = Date(); lastWidgetRevision = loaded.sourceRevision
+    if loaded.failure != nil {
+      notice = t("小组件读取或缓存更新失败，已保留资料并等待重试。", "Widget data/cache update failed. Data was preserved; retry pending.")
+    }
   }
   func update(_ operation: (inout State) throws -> Void) {
-    guard let db else {
+    guard db != nil else {
       error = t("数据库尚未就绪", "Database unavailable")
       return
     }
     do {
-      state = try db.transaction(operation)
+      error = nil
+      let current = try Database()
+      db = current
+      state = try current.transaction(operation)
       NotificationCenter.default.post(name:Notification.Name("GaoSeries.monthly.changed"),object:nil)
       DistributedNotificationCenter.default().postNotificationName(Notification.Name("GaoSeries.monthly.changed"),object:nil,userInfo:nil,deliverImmediately:true)
       fatal = nil
-      WidgetCenter.shared.reloadAllTimelines()
+      refreshWidgets(reason: "business-change")
+      scheduleMidnightRefresh()
       refreshNotifications()
-      do { try db.snapshot() } catch {
+      do { try current.snapshot() } catch {
         self.error =
           t("记录已保存，但自动快照失败：", "Saved, but snapshot failed: ") + error.localizedDescription
       }
@@ -223,9 +277,12 @@ import WidgetKit
       alert.addButton(withTitle: t("恢复", "Restore"))
       alert.addButton(withTitle: t("取消", "Cancel"))
       guard alert.runModal() == .alertFirstButtonReturn else { return }
-      try db?.restore(s)
+      guard let db else {
+        throw AppError("资料库暂不可用，请在设置的数据页使用完整资料恢复；现有文件已保留 / Database unavailable; use complete data restore in Settings")
+      }
+      try db.restore(s)
       reload()
-      WidgetCenter.shared.reloadAllTimelines()
+      guard fatal == nil else { throw AppError(fatal!) }
       notice = t("备份已恢复", "Backup restored")
     } catch { self.error = error.localizedDescription }
   }
@@ -403,10 +460,10 @@ import WidgetKit
   }
   func erase() {
     do {
-      try db?.erase()
+      guard let db else { throw AppError("数据库暂不可用，未删除任何资料 / Database unavailable; nothing was erased") }
+      try db.erase()
       UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
       reload()
-      WidgetCenter.shared.reloadAllTimelines()
     } catch { self.error = error.localizedDescription }
   }
 }

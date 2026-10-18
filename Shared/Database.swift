@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import SQLite3
 
@@ -21,43 +22,80 @@ final class Database {
     else { throw AppError("共享容器不可用，请重新安装签名版本 / Shared container unavailable") }
     return url.appendingPathComponent("Monthly", isDirectory: true)
   }
-  init(directory: URL? = nil, createIfMissing: Bool = true) throws {
+  /// Only the app may initialize a genuinely new store; extensions always open existing data.
+  static func openForApplication(hasExistingUserSettings: Bool) throws -> Database {
+    let directory = try location()
+    let file = directory.appendingPathComponent("monthly.sqlite")
+    if FileManager.default.fileExists(atPath: file.path) {
+      return try Database(directory: directory)
+    }
+    guard !hasExistingUserSettings else {
+      throw AppError("原有数据库缺失，请从备份恢复；不会创建空白资料 / Existing database missing; restore a backup")
+    }
+    return try Database(directory: directory, createIfMissing: true)
+  }
+  init(
+    directory: URL? = nil, createIfMissing: Bool = false, readOnly: Bool = false,
+    busyTimeoutMilliseconds: Int = 250
+  ) throws {
     self.directory = try directory ?? Self.location()
-    if createIfMissing {
-      try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
-    }
-    guard
-      sqlite3_open_v2(
-        self.directory.appendingPathComponent("monthly.sqlite").path, &db,
-        (createIfMissing ? SQLITE_OPEN_CREATE : 0) | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK
-    else { throw AppError("数据库无法打开 / Cannot open database") }
-    sqlite3_busy_timeout(db, 15_000)
-    // Extensions must never seed a missing table/row or replace an unreadable save.
-    // Opening without SQLITE_OPEN_CREATE also closes the preflight file-existence race.
-    if !createIfMissing {
-      _ = try read()
-      return
-    }
-    try withBusyRetry {
-      // journal_mode=WAL 是启动期重入点：已是 WAL 时保持原样（只读查询），避免并发启动时争抢写锁。
-      if try journalMode() != "wal" { try exec("PRAGMA journal_mode=WAL") }
-      try exec("PRAGMA synchronous=FULL")
-      try exec(
-        "CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),json BLOB NOT NULL)")
-      try exec("BEGIN IMMEDIATE")
-      do {
-        var st: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM state", -1, &st, nil) == SQLITE_OK else {
-          throw error()
-        }
-        defer { sqlite3_finalize(st) }
-        guard sqlite3_step(st) == SQLITE_ROW else { throw error() }
-        if sqlite3_column_int(st, 0) == 0 { try write(State()) }
-        try exec("COMMIT")
-      } catch {
-        try? exec("ROLLBACK")
-        throw error
+    let fm = FileManager.default
+    let file = self.directory.appendingPathComponent("monthly.sqlite")
+    var createdNewFile = false
+    if !fm.fileExists(atPath: file.path) {
+      guard createIfMissing, !readOnly else {
+        throw AppError("数据库缺失，已保留现有资料；请打开 App 检查或从备份恢复 / Database missing; existing files preserved")
       }
+      var isDirectory: ObjCBool = false
+      if fm.fileExists(atPath: self.directory.path, isDirectory: &isDirectory) {
+        guard isDirectory.boolValue, try fm.contentsOfDirectory(atPath: self.directory.path).isEmpty else {
+          throw AppError("发现已有资料但数据库缺失，请从备份恢复 / Existing files found without a database; restore a backup")
+        }
+      } else {
+        try fm.createDirectory(at: self.directory, withIntermediateDirectories: true)
+      }
+      // O_EXCL prevents a concurrent initializer's file from being replaced or truncated.
+      let descriptor = Darwin.open(file.path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+      guard descriptor >= 0 else {
+        throw AppError("无法安全初始化数据库，请重试；现有文件未被替换 / Could not exclusively initialize database; retry")
+      }
+      Darwin.close(descriptor)
+      createdNewFile = true
+    }
+    do {
+      let flags = (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE) | SQLITE_OPEN_FULLMUTEX
+      guard sqlite3_open_v2(file.path, &db, flags, nil) == SQLITE_OK else {
+        throw AppError("数据库无法打开，现有资料已保留 / Cannot open database; existing data preserved")
+      }
+      // Four attempts with 250 ms waits plus short backoff keep the default lock budget below 2 s.
+      sqlite3_busy_timeout(db, Int32(max(0, min(250, busyTimeoutMilliseconds))))
+      if !createdNewFile {
+        // Validate before any PRAGMA/schema writes, including when a caller permits initialization.
+        _ = try readRecord()
+      }
+      if !readOnly {
+        try withBusyRetry {
+          if try journalMode() != "wal" { try exec("PRAGMA journal_mode=WAL") }
+          try exec("PRAGMA synchronous=FULL")
+        }
+      }
+      if createdNewFile {
+        try withBusyRetry {
+          try exec("BEGIN IMMEDIATE")
+          do {
+            try exec("CREATE TABLE state(id INTEGER PRIMARY KEY CHECK(id=1),json BLOB NOT NULL)")
+            try write(State())
+            try exec("COMMIT")
+          } catch {
+            try? exec("ROLLBACK")
+            throw error
+          }
+        }
+      }
+    } catch {
+      sqlite3_close(db)
+      db = nil
+      throw error
     }
   }
   deinit { sqlite3_close(db) }
@@ -71,7 +109,7 @@ final class Database {
     return String(cString: c).lowercased()
   }
   private var busy: Bool { sqlite3_errcode(db) & 0xFF == SQLITE_BUSY }
-  /// 数据库忙时有限重试（最多 9 次，间隔递增、封顶 0.5 秒）；非忙碌类错误直接抛出。
+  /// 数据库忙时最多 4 次尝试；只重试 busy，不能把读取失败当成空状态。
   /// WAL 模式下 COMMIT/写入撞见他人提交会立即返回 BUSY_SNAPSHOT（不等待 busy 超时），
   /// 只能整体重试事务；忙碌判定取自错误构造时捕获的标记，因为回滚会清除连接上的错误码。
   private func withBusyRetry<T>(_ body: () throws -> T) throws -> T {
@@ -79,8 +117,8 @@ final class Database {
     while true {
       do { return try body() } catch let e as AppError {
         attempt += 1
-        guard attempt < 10, e.busy else { throw e }
-        Thread.sleep(forTimeInterval: min(0.5, 0.1 * Double(attempt)))
+        guard attempt < 4, e.busy else { throw e }
+        Thread.sleep(forTimeInterval: 0.025 * Double(attempt))
       }
     }
   }
@@ -99,17 +137,38 @@ final class Database {
     }
   }
   func read() throws -> State {
+    try readRecord().state
+  }
+  /// State and its exact stored bytes come from the same SELECT snapshot.
+  /// Consumers hash payload, not a re-encoding of Set-containing State values.
+  func readRecord() throws -> (state: State, payload: Data) {
     var st: OpaquePointer?
     guard sqlite3_prepare_v2(db, "SELECT json FROM state WHERE id=1", -1, &st, nil) == SQLITE_OK
     else { throw error() }
     defer { sqlite3_finalize(st) }
-    guard sqlite3_step(st) == SQLITE_ROW, let ptr = sqlite3_column_blob(st, 0) else {
+    let result = sqlite3_step(st)
+    guard result != SQLITE_DONE else {
+      throw AppError("业务记录缺失，不会创建空白资料；请从备份恢复 / Saved record missing; restore a backup")
+    }
+    guard result == SQLITE_ROW else {
       throw error()
     }
-    let s = try JSONDecoder().decode(
-      State.self, from: Data(bytes: ptr, count: Int(sqlite3_column_bytes(st, 0))))
+    guard let ptr = sqlite3_column_blob(st, 0), sqlite3_column_bytes(st, 0) > 0 else {
+      throw AppError("业务记录为空，已保留原文件 / Saved record is empty; original file preserved")
+    }
+    let payload = Data(bytes: ptr, count: Int(sqlite3_column_bytes(st, 0)))
+    struct Version: Decodable { var schemaVersion: Int; var rulesVersion: Int }
+    let version: Version
+    do { version = try JSONDecoder().decode(Version.self, from: payload) }
+    catch { throw AppError("业务数据无法解码，已保留原文件 / Saved data is unreadable; original file preserved") }
+    guard version.schemaVersion == 1, version.rulesVersion == 1 else {
+      throw AppError("存档版本不受支持，请使用匹配的应用版本；原文件已保留 / Unsupported save version; original file preserved (schema \(version.schemaVersion), rules \(version.rulesVersion))")
+    }
+    let s: State
+    do { s = try JSONDecoder().decode(State.self, from: payload) }
+    catch { throw AppError("业务数据无法解码，已保留原文件 / Saved data is unreadable; original file preserved") }
     try Engine.validate(s)
-    return s
+    return (s, payload)
   }
   private func write(_ s: State) throws {
     let data = try JSONEncoder().encode(s)
@@ -132,10 +191,16 @@ final class Database {
       try exec("BEGIN IMMEDIATE")
       do {
         var s = try read()
+        let previousUpdatedAt = s.updatedAt
+        let previousContent = try Self.canonicalContent(s)
         try operation(&s)
         try Engine.validate(s)
-        s.updatedAt = Date()
-        try write(s)
+        if try Self.canonicalContent(s) != previousContent {
+          s.updatedAt = Date()
+          try write(s)
+        } else {
+          s.updatedAt = previousUpdatedAt
+        }
         try exec("COMMIT")
         return s
       } catch {
@@ -143,6 +208,19 @@ final class Database {
         throw error
       }
     }
+  }
+  /// Codable Sets are unordered. Normalize the three persisted Sets before comparing business data.
+  private static func canonicalContent(_ state: State) throws -> Data {
+    let encoded = try JSONEncoder().encode(state)
+    guard var object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
+      var pet = object["pet"] as? [String: Any]
+    else { throw AppError("无法校验资料变更 / Cannot validate data changes") }
+    object.removeValue(forKey: "updatedAt")
+    object["tombstones"] = state.tombstones.sorted()
+    pet["displayed"] = state.pet.displayed.sorted()
+    pet["titles"] = state.pet.titles.sorted()
+    object["pet"] = pet
+    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
   }
   static func backup(_ s: State) throws -> Data {
     let data = try JSONEncoder().encode(s)

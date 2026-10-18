@@ -119,7 +119,7 @@ import SQLite3
     let fm = FileManager.default
     let directory = fm.temporaryDirectory.appendingPathComponent("GaoYueGong-benefit-test-" + UUID().uuidString)
     defer { try? fm.removeItem(at: directory) }
-    let initial = try Database(directory: directory)
+    let initial = try Database(directory: directory, createIfMissing: true)
     try initial.transaction {
       $0 = fixture()
       $0.benefits = [daily]
@@ -213,7 +213,7 @@ import SQLite3
 
     // An existing valid store remains writable for the AppIntent's fresh-state transaction.
     let validDirectory = root.appendingPathComponent("valid")
-    let owner = try Database(directory: validDirectory)
+    let owner = try Database(directory: validDirectory, createIfMissing: true)
     try owner.transaction { $0.preferences.timezone = "Asia/Shanghai" }
     let widget = try Database(directory: validDirectory, createIfMissing: false)
     try widget.transaction { $0.preferences.privacy = true }
