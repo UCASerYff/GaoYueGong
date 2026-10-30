@@ -24,6 +24,7 @@ public struct MonthlyModuleView: View {
         RootView()
             .environmentObject(store)
             .environment(\.locale, Locale(identifier: store.en ? "en_US" : "zh_CN"))
+            .environment(\.timeZone, Engine.calendar(store.state).timeZone)
             .onAppear(perform: handleRoute)
             .onReceive(NotificationCenter.default.publisher(for: Notification.Name("GaoSeries.monthly.game"))) { _ in store.tab = 4 }
             .onChange(of: routeRevision) { _, _ in handleRoute() }
@@ -49,5 +50,6 @@ public struct MonthlySettingsView: View {
         SettingsView()
             .environmentObject(store)
             .environment(\.locale, Locale(identifier: store.en ? "en_US" : "zh_CN"))
+            .environment(\.timeZone, Engine.calendar(store.state).timeZone)
     }
 }

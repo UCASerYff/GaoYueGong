@@ -159,6 +159,11 @@ enum MonthlyWidgetData {
           if loaded.failure != nil {
             var pending = (try? JSONDecoder().decode(Pending.self, from: Data(contentsOf: pendingURL)))
               ?? Pending(requestedAt: now, reason: "read-retry", revision: nil, needsRetry: true)
+            // A previous request may already have been acknowledged by both kinds.
+            // Re-add the consumer that failed, so another kind's success cannot clear its retry.
+            let failedKind = String(consumer.split(separator: "/").first ?? "")
+            let retryKinds = kinds.contains(failedKind) ? [failedKind] : kinds
+            pending.pendingKinds = Array(Set(pending.pendingKinds).union(retryKinds)).sorted()
             pending.needsRetry = true
             try? atomic(pending, to: pendingURL)
           } else if acknowledgesReload,

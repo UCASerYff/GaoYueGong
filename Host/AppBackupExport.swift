@@ -35,7 +35,7 @@ enum AppBackupExport {
     static func export(appSupport: URL?, group: URL?, destination: URL) throws -> Summary {
         let fileManager = FileManager.default
         let workRoot = fileManager.temporaryDirectory
-            .appendingPathComponent("gqns-export-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("gqns-export-\(UUID().uuidString).noindex", isDirectory: true)
         defer { try? fileManager.removeItem(at: workRoot) }
         let payload = workRoot.appendingPathComponent("payload", isDirectory: true)
         let stagedZip = workRoot.appendingPathComponent("backup.zip")
@@ -57,7 +57,7 @@ enum AppBackupExport {
         }
         guard copied > 0 else { throw ExportError.noSources }
 
-        let preferences:[String:[String:Any]] = ["standard":UserDefaults.standard.persistentDomain(forName:Bundle.main.bundleIdentifier!) ?? [:],"module":UserDefaults.standard.persistentDomain(forName:"com.gaoseries.GaoYueGong.Monthly") ?? [:]]
+        let preferences:[String:[String:Any]] = ["standard":try BackupIntegrity.preferences.read(.standard) ?? [:],"module":try BackupIntegrity.preferences.read(.module) ?? [:]]
         try PropertyListSerialization.data(fromPropertyList:preferences,format:.binary,options:0).write(to:payload.appendingPathComponent("preferences.plist"))
         let hashes = try BackupIntegrity.manifest(payload)
         let manifest = BackupIntegrity.Manifest(version:Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String ?? "3.63",files:hashes)

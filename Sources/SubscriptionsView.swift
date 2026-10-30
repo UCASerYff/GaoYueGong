@@ -302,8 +302,8 @@ struct SubscriptionDetail: View {
     } message: {
       Text(
         store.t(
-          "相关流水、领取记录与自评一并移除，统计会随之改变。",
-          "Payments, claims and reviews will be removed. Statistics will change."))
+          "相关流水与自评一并移除，统计会随之改变。关联权益转为独立权益，保留其打卡记录。",
+          "Payments and reviews will be removed, affecting statistics. Linked benefits become standalone and keep their claim history."))
     }
     .sheet(isPresented: $showCancel) {
       VStack(alignment: .leading, spacing: 20) {

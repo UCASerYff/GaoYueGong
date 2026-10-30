@@ -42,7 +42,10 @@ struct TodayView: View {
     HStack {
       Heading(
         title: store.t("今天，也要供得明白。", "Make every subscription count."),
-        subtitle: Date().formatted(.dateTime.year().month().day().weekday()))
+        subtitle: Date().formatted(Date.FormatStyle(
+          locale: Locale(identifier: store.en ? "en_US" : "zh_CN"),
+          calendar: Engine.calendar(store.state), timeZone: Engine.calendar(store.state).timeZone
+        ).year().month().day().weekday()))
       Spacer()
       if store.state.preferences.game {
         Label(store.state.pet.name, systemImage: "pawprint.fill").font(.callout).foregroundStyle(

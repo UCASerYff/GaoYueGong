@@ -43,15 +43,16 @@ import SQLite3
     return result
   }
   static func main() throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("monthly-widget-refresh-" + UUID().uuidString)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("monthly-widget-refresh-" + UUID().uuidString + ".noindex")
     defer { try? FileManager.default.removeItem(at: root) }
     try dataAndTime(root.appendingPathComponent("values"))
     try unavailableData(root)
     try reloadRequestFailure(root.appendingPathComponent("reload-request-lock"))
+    try acknowledgedKindFailure(root.appendingPathComponent("acknowledged-kind-failure"))
     try publicationFailure(root.appendingPathComponent("cache-publication-failure"))
     try concurrency(root.appendingPathComponent("concurrent"))
     try timelineDates()
-    print("PASS Widget refresh: original source/hash and separate clocks; CRUD/claim consistency; acknowledgement revision checks; missing/corrupt/future/busy cache fallback; privacy on fallback; invalid-cache fail-closed; reload-request failure markers; truthful failed-publication timestamp; concurrent atomic publication; midnight/month/DST timeline derivations")
+    print("PASS Widget refresh: original source/hash and separate clocks; CRUD/claim consistency; acknowledgement revision checks; failed-kind retry survives another kind's success; missing/corrupt/future/busy cache fallback; privacy on fallback; invalid-cache fail-closed; reload-request failure markers; truthful failed-publication timestamp; concurrent atomic publication; midnight/month/DST timeline derivations")
   }
 
   static func dataAndTime(_ directory: URL) throws {
@@ -242,6 +243,44 @@ import SQLite3
     try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
     let recovered = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(6), consumer: "recovered-publication")
     try expect(recovered.failure == nil && recovered.snapshotGeneratedAt == now.addingTimeInterval(6), "Successful retry did not publish the changed revision")
+  }
+
+  static func acknowledgedKindFailure(_ directory: URL) throws {
+    _ = try seed(directory)
+    let overview = "GaoYueGong/systemSmall/timeline"
+    let benefits = "GaoYueGongBenefits/systemSmall/timeline"
+    try MonthlyWidgetData.recordReloadRequest(reason: "both-kinds", directory: directory, now: now)
+    _ = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(1), consumer: overview, acknowledgesReload: true)
+    _ = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(2), consumer: benefits, acknowledgesReload: true)
+    try expect(try !pending(directory).needsRetry && pending(directory).pendingKinds.isEmpty, "Fixture did not acknowledge both widget kinds")
+
+    let holder = try raw(directory)
+    defer { sqlite3_close(holder) }
+    try sql(holder, "PRAGMA journal_mode=DELETE")
+    try sql(holder, "BEGIN EXCLUSIVE")
+    let failed = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(3), consumer: benefits, acknowledgesReload: true)
+    try sql(holder, "ROLLBACK")
+    try expect(failed.failure == .busy && failed.fromCache, "Fixture did not fail the previously acknowledged benefits read")
+    try expect(try pending(directory).needsRetry && pending(directory).pendingKinds == ["GaoYueGongBenefits"], "Read failure did not re-add the failed widget kind")
+
+    _ = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(4), consumer: overview, acknowledgesReload: true)
+    try expect(try pending(directory).needsRetry && pending(directory).pendingKinds == ["GaoYueGongBenefits"], "Overview success cleared an outstanding benefits retry")
+    _ = MonthlyWidgetData.load(directory: directory, now: now.addingTimeInterval(5), consumer: benefits, acknowledgesReload: true)
+    try expect(try !pending(directory).needsRetry && pending(directory).pendingKinds.isEmpty, "Recovered benefits read did not clear its own retry")
+
+    // App-level and unknown consumers cannot safely narrow the failure to one widget kind.
+    for (index, consumer) in ["app/read-failed", "unknown-consumer"].enumerated() {
+      let time = now.addingTimeInterval(Double(10 + index * 4))
+      try sql(holder, "BEGIN EXCLUSIVE")
+      let failed = MonthlyWidgetData.load(directory: directory, now: time, consumer: consumer)
+      try sql(holder, "ROLLBACK")
+      try expect(failed.failure == .busy, "Fixture did not fail the non-widget read")
+      try expect(try pending(directory).needsRetry && Set(pending(directory).pendingKinds) == Set(MonthlyWidgetData.kinds), "Non-widget failure did not conservatively re-add both kinds")
+      _ = MonthlyWidgetData.load(directory: directory, now: time.addingTimeInterval(1), consumer: overview, acknowledgesReload: true)
+      try expect(try pending(directory).needsRetry, "One kind cleared an app-level retry for both kinds")
+      _ = MonthlyWidgetData.load(directory: directory, now: time.addingTimeInterval(2), consumer: benefits, acknowledgesReload: true)
+      try expect(try !pending(directory).needsRetry, "Both successful kinds did not clear the app-level retry")
+    }
   }
 
   static func concurrency(_ directory: URL) throws {
